@@ -3,5 +3,5 @@ __pycache__/
 .env
 index.jsonl
 memory/generated/
-state/index.jsonl
-state/generated/
+state/*/index.jsonl
+state/*/generated/

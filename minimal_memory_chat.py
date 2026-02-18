@@ -12,22 +12,25 @@ from dotenv import dotenv_values, load_dotenv
 from openai import OpenAI
 import requests
 
-
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 SRC_DIR = os.path.join(BASE_DIR, "src")
 if SRC_DIR not in sys.path and os.path.isdir(SRC_DIR):
     sys.path.insert(0, SRC_DIR)
 
-INSTRUCTIONS_PATH = os.path.join(BASE_DIR, "instructions.md")
-INDEX_PATH = os.path.join(BASE_DIR, "index.jsonl")
-ENV_PATH = os.path.join(BASE_DIR, ".env")
+from research_manager.state.paths import default_state_paths
+
+STATE_PATHS = default_state_paths()
+RM_ENV = STATE_PATHS.env_name
+INSTRUCTIONS_PATH = str(STATE_PATHS.instructions_md)
+INDEX_PATH = str(STATE_PATHS.index_jsonl)
+ENV_PATH = str(STATE_PATHS.env_file)
 PYTHON_GLOBAL_SCOPE: Dict[str, Any] = {}
 
 
 # ---- Auto-generated project briefs (lightweight repo memory) ----
-PROJECT_BRIEFS_PATH = os.path.join(BASE_DIR, "memory", "generated", "_project_briefs.json")
-PROJECT_BRIEFS_META_PATH = os.path.join(BASE_DIR, "memory", "generated", "_project_briefs_meta.json")
-REPO_MAP_PATH = os.path.join(BASE_DIR, "memory", "generated", "_repo_map.json")
+PROJECT_BRIEFS_PATH = str(STATE_PATHS.generated_dir / "_project_briefs.json")
+PROJECT_BRIEFS_META_PATH = str(STATE_PATHS.generated_dir / "_project_briefs_meta.json")
+REPO_MAP_PATH = str(STATE_PATHS.generated_dir / "_repo_map.json")
 
 
 def _sha256_text(text: str) -> str:
@@ -62,7 +65,8 @@ def build_repo_map(max_files: int = 2000) -> Dict[str, Any]:
             if name.startswith('.'):  # skip dotfiles
                 continue
             rel = os.path.relpath(os.path.join(root, name), BASE_DIR)
-            if rel.startswith("memory/generated/_project_briefs") or rel.startswith("memory/generated/_repo_map"):
+            generated_prefix = f"state/{RM_ENV}/generated/"
+            if rel.startswith(f"{generated_prefix}_project_briefs") or rel.startswith(f"{generated_prefix}_repo_map"):
                 continue
             repo_map["files"].append(rel)
             count += 1
@@ -173,6 +177,12 @@ PYTHON_TOOL = [
 def ensure_files() -> None:
     if not os.path.exists(INSTRUCTIONS_PATH):
         raise FileNotFoundError(f"Missing required file: {INSTRUCTIONS_PATH}")
+    os.makedirs(os.path.dirname(INDEX_PATH), exist_ok=True)
+    os.makedirs(str(STATE_PATHS.generated_dir), exist_ok=True)
+    legacy_index_path = os.path.join(BASE_DIR, "index.jsonl")
+    if not os.path.exists(INDEX_PATH) and os.path.exists(legacy_index_path):
+        with open(legacy_index_path, "r", encoding="utf-8") as src, open(INDEX_PATH, "w", encoding="utf-8") as dst:
+            dst.write(src.read())
     if not os.path.exists(INDEX_PATH):
         with open(INDEX_PATH, "w", encoding="utf-8"):
             pass
@@ -511,6 +521,8 @@ def main() -> None:
     print(f"Model: {model}")
     print(f"API key source: {api_key_source} ({api_key[:10]}...)")
     print(f"S2_KEY loaded: {bool(os.getenv('S2_KEY'))}")
+    print(f"RM_ENV: {RM_ENV}")
+    print(f"State index: {INDEX_PATH}")
     print("Type 'exit' to quit.\n")
 
     while True:

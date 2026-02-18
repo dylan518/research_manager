@@ -188,3 +188,28 @@ python gpt5_semantic_scholar_chat.py
 - "Read the full paper for CorpusID:123456 and summarize evaluation."
 
 If a paper does not expose an open-access PDF through Semantic Scholar, the assistant will report that and suggest alternatives.
+
+---
+
+## Runtime State Environments
+
+`minimal_memory_chat.py` supports isolated runtime state environments via `RM_ENV`.
+
+- Default: `dev`
+- Allowed values: `dev`, `prod`
+- State files:
+  - `state/dev/index.jsonl` + `state/dev/generated/`
+  - `state/prod/index.jsonl` + `state/prod/generated/`
+
+Run examples:
+
+```bash
+RM_ENV=dev python minimal_memory_chat.py
+RM_ENV=prod python minimal_memory_chat.py
+```
+
+For production-style runs that always sync to `main` first:
+
+```bash
+./scripts/run_prod.sh
+```
