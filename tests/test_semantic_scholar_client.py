@@ -1,7 +1,7 @@
 import unittest
 from unittest.mock import MagicMock, patch
 
-from semantic_scholar_client import (
+from research_manager.clients.semantic_scholar import (
     GRAPH_BASE_URL,
     RECOMMENDATIONS_BASE_URL,
     SemanticScholarClient,
@@ -15,7 +15,7 @@ class SemanticScholarClientTests(unittest.TestCase):
     def test_init_sets_api_key_header(self) -> None:
         self.assertEqual(self.client.session.headers.get("x-api-key"), "test-key")
 
-    @patch("semantic_scholar_client.requests.Session.get")
+    @patch("research_manager.clients.semantic_scholar.requests.Session.get")
     def test_search_papers_calls_expected_endpoint_and_clamps_limit(self, mock_get: MagicMock) -> None:
         mock_response = MagicMock()
         mock_response.json.return_value = {"data": []}
@@ -34,7 +34,7 @@ class SemanticScholarClientTests(unittest.TestCase):
         self.assertEqual(called_params["year"], "2024")
         self.assertIn("title", called_params["fields"])
 
-    @patch("semantic_scholar_client.requests.Session.get")
+    @patch("research_manager.clients.semantic_scholar.requests.Session.get")
     def test_get_paper_details_calls_expected_endpoint(self, mock_get: MagicMock) -> None:
         mock_response = MagicMock()
         mock_response.json.return_value = {"paperId": "abc123"}
@@ -47,7 +47,7 @@ class SemanticScholarClientTests(unittest.TestCase):
         called_url = mock_get.call_args.kwargs["url"] if "url" in mock_get.call_args.kwargs else mock_get.call_args.args[0]
         self.assertEqual(called_url, f"{GRAPH_BASE_URL}/paper/abc123")
 
-    @patch("semantic_scholar_client.requests.Session.get")
+    @patch("research_manager.clients.semantic_scholar.requests.Session.get")
     def test_recommend_papers_calls_expected_endpoint_and_clamps_limit(self, mock_get: MagicMock) -> None:
         mock_response = MagicMock()
         mock_response.json.return_value = {"recommendedPapers": []}
@@ -69,8 +69,8 @@ class SemanticScholarClientTests(unittest.TestCase):
         self.assertFalse(result["success"])
         self.assertIn("No open-access PDF URL available", result["reason"])
 
-    @patch("semantic_scholar_client.fitz.open")
-    @patch("semantic_scholar_client.requests.Session.get")
+    @patch("research_manager.clients.semantic_scholar.fitz.open")
+    @patch("research_manager.clients.semantic_scholar.requests.Session.get")
     def test_read_full_paper_text_success_and_truncation(
         self, mock_get: MagicMock, mock_fitz_open: MagicMock
     ) -> None:

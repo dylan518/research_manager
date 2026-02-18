@@ -1,5 +1,5 @@
 import pytest
-from tools import fs_utils
+from research_manager.tools import fs_utils
 
 
 def test_safe_resolve_allows_memory():

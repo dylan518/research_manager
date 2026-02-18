@@ -3,7 +3,9 @@ import contextlib
 import io
 import json
 import os
+import sys
 import time
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from dotenv import dotenv_values, load_dotenv
@@ -12,6 +14,10 @@ import requests
 
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+SRC_DIR = os.path.join(BASE_DIR, "src")
+if SRC_DIR not in sys.path and os.path.isdir(SRC_DIR):
+    sys.path.insert(0, SRC_DIR)
+
 INSTRUCTIONS_PATH = os.path.join(BASE_DIR, "instructions.md")
 INDEX_PATH = os.path.join(BASE_DIR, "index.jsonl")
 ENV_PATH = os.path.join(BASE_DIR, ".env")
@@ -19,9 +25,9 @@ PYTHON_GLOBAL_SCOPE: Dict[str, Any] = {}
 
 
 # ---- Auto-generated project briefs (lightweight repo memory) ----
-PROJECT_BRIEFS_PATH = os.path.join(BASE_DIR, "memory", "_project_briefs.json")
-PROJECT_BRIEFS_META_PATH = os.path.join(BASE_DIR, "memory", "_project_briefs_meta.json")
-REPO_MAP_PATH = os.path.join(BASE_DIR, "memory", "_repo_map.json")
+PROJECT_BRIEFS_PATH = os.path.join(BASE_DIR, "memory", "generated", "_project_briefs.json")
+PROJECT_BRIEFS_META_PATH = os.path.join(BASE_DIR, "memory", "generated", "_project_briefs_meta.json")
+REPO_MAP_PATH = os.path.join(BASE_DIR, "memory", "generated", "_repo_map.json")
 
 
 def _sha256_text(text: str) -> str:
@@ -56,7 +62,7 @@ def build_repo_map(max_files: int = 2000) -> Dict[str, Any]:
             if name.startswith('.'):  # skip dotfiles
                 continue
             rel = os.path.relpath(os.path.join(root, name), BASE_DIR)
-            if rel.startswith("memory/_project_briefs") or rel.startswith("memory/_repo_map"):
+            if rel.startswith("memory/generated/_project_briefs") or rel.startswith("memory/generated/_repo_map"):
                 continue
             repo_map["files"].append(rel)
             count += 1
@@ -193,6 +199,17 @@ def read_index_entries() -> List[Dict[str, Any]]:
     return entries
 
 
+def build_model_history_items(entries: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    allowed_roles = {"user", "assistant", "system", "developer"}
+    items: List[Dict[str, Any]] = []
+    for entry in entries:
+        role = entry.get("role")
+        content = entry.get("content")
+        if isinstance(role, str) and role in allowed_roles and content is not None:
+            items.append({"role": role, "content": content})
+    return items
+
+
 def append_item(item: Dict[str, Any]) -> Dict[str, Any]:
     if not isinstance(item, dict):
         raise ValueError("item must be a JSON object")
@@ -240,6 +257,11 @@ def run_python(code: str) -> Dict[str, Any]:
             os.environ[key] = value
 
     stdout = io.StringIO()
+    instructions_original = None
+    instructions_exists = os.path.exists(INSTRUCTIONS_PATH)
+    if instructions_exists:
+        with open(INSTRUCTIONS_PATH, "r", encoding="utf-8") as _f:
+            instructions_original = _f.read()
 
     def get_env(name: str, default: Optional[str] = None) -> Optional[str]:
         return os.getenv(name, default)
@@ -346,7 +368,7 @@ def run_python(code: str) -> Dict[str, Any]:
 
     # Context management helpers
     try:
-        from tools.context_manager import (
+        from research_manager.tools.context_manager import (
             ContextPaths,
             snapshot_index,
             prune_index_keep_last_messages,
@@ -364,7 +386,7 @@ def run_python(code: str) -> Dict[str, Any]:
 
     # Claude Code CLI helper (if installed)
     try:
-        from tools.claude_code import run_claude, which_claude
+        from research_manager.tools.claude_code import run_claude, which_claude
     except Exception:  # noqa: BLE001
         run_claude = None
         which_claude = None
@@ -412,6 +434,33 @@ def run_python(code: str) -> Dict[str, Any]:
 
         with contextlib.redirect_stdout(stdout):
             exec(compiled, PYTHON_GLOBAL_SCOPE, PYTHON_GLOBAL_SCOPE)
+
+        # Hard guard: instructions.md is immutable at runtime.
+        instructions_changed = False
+        if instructions_original is None:
+            if os.path.exists(INSTRUCTIONS_PATH):
+                instructions_changed = True
+                os.remove(INSTRUCTIONS_PATH)
+        else:
+            if not os.path.exists(INSTRUCTIONS_PATH):
+                instructions_changed = True
+                with open(INSTRUCTIONS_PATH, "w", encoding="utf-8") as _f:
+                    _f.write(instructions_original)
+            else:
+                with open(INSTRUCTIONS_PATH, "r", encoding="utf-8") as _f:
+                    now_text = _f.read()
+                if now_text != instructions_original:
+                    instructions_changed = True
+                    with open(INSTRUCTIONS_PATH, "w", encoding="utf-8") as _f:
+                        _f.write(instructions_original)
+
+        if instructions_changed:
+            return {
+                "ok": False,
+                "stdout": stdout.getvalue(),
+                "error": "Modification of instructions.md is not allowed and was reverted.",
+            }
+
         stdout_text = stdout.getvalue()
         result = PYTHON_GLOBAL_SCOPE.get("result", PYTHON_GLOBAL_SCOPE.get("__last_expression_result__"))
         if result is None and stdout_text.strip():
@@ -458,8 +507,6 @@ def main() -> None:
 
     client = OpenAI(api_key=api_key)
     model = "gpt-5.2"
-    instructions = load_instructions()
-
     print("Minimal memory chat")
     print(f"Model: {model}")
     print(f"API key source: {api_key_source} ({api_key[:10]}...)")
@@ -476,7 +523,8 @@ def main() -> None:
 
         # index.jsonl is the full chat history; append current user turn first.
         append_message("user", user_input)
-        history_items = read_index_entries()
+        history_items = build_model_history_items(read_index_entries())
+        instructions = load_instructions()
 
         response = client.responses.create(
             model=model,

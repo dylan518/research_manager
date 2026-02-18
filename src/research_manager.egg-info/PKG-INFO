@@ -1,0 +1,5 @@
+Metadata-Version: 2.4
+Name: research_manager
+Version: 0.1.0
+Summary: Local research workspace with tool-enabled chat runtime
+Requires-Python: >=3.10

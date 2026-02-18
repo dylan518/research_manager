@@ -1,4 +1,4 @@
-from tools.claude_code import which_claude
+from research_manager.tools.claude_code import which_claude
 
 
 def test_which_claude_returns_dict():

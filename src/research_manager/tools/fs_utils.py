@@ -8,7 +8,8 @@ from typing import Iterable, List, Optional
 
 
 def repo_base() -> Path:
-    return Path(__file__).resolve().parents[1]
+    # src/research_manager/tools/fs_utils.py -> repo root is 3 levels up
+    return Path(__file__).resolve().parents[3]
 
 
 def safe_resolve(rel_path: str, allow_roots: Optional[Iterable[str]] = None) -> Path:

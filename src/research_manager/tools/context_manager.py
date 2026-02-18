@@ -86,7 +86,7 @@ Conservative: keeps items after the earliest kept message index.
 Prefer snapshot before pruning.
 """
     items = read_jsonl(paths.index_path)
-    msg_idxs = [i for i,it in enumerate(items) if it.get("role") in {"user","assistant","system"} and isinstance(it.get("content"), str)]
+    msg_idxs = [i for i, it in enumerate(items) if it.get("role") in {"user", "assistant", "system"} and isinstance(it.get("content"), str)]
     if not msg_idxs:
         return {"ok": True, "kept": 0, "original": len(items)}
     keep_last = max(1, keep_last)
@@ -94,3 +94,17 @@ Prefer snapshot before pruning.
     pruned = items[start_idx:]
     write_jsonl(paths.index_path, pruned)
     return {"ok": True, "original": len(items), "kept": len(pruned), "start_index": start_idx}
+
+
+def prune_index_keep_last_dialog_turns(paths: ContextPaths, keep_last_turns: int = 80) -> Dict[str, Any]:
+    """Aggressively prune index.jsonl by keeping only the last N dialog messages (user/assistant/system).
+
+    Drops older tool call artifacts entirely. This WILL break tool-call threading, but keeps future context small.
+    Prefer snapshot before pruning.
+    """
+    items = read_jsonl(paths.index_path)
+    msgs = [it for it in items if it.get("role") in {"user", "assistant", "system"} and isinstance(it.get("content"), str)]
+    keep_last_turns = max(1, keep_last_turns)
+    kept_msgs = msgs[-keep_last_turns:] if len(msgs) > keep_last_turns else msgs
+    write_jsonl(paths.index_path, kept_msgs)
+    return {"ok": True, "original": len(items), "original_messages": len(msgs), "kept": len(kept_msgs)}
