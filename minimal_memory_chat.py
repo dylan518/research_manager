@@ -3,6 +3,7 @@ import contextlib
 import io
 import json
 import os
+import time
 from typing import Any, Dict, List, Optional
 
 from dotenv import dotenv_values, load_dotenv
@@ -15,6 +16,137 @@ INSTRUCTIONS_PATH = os.path.join(BASE_DIR, "instructions.md")
 INDEX_PATH = os.path.join(BASE_DIR, "index.jsonl")
 ENV_PATH = os.path.join(BASE_DIR, ".env")
 PYTHON_GLOBAL_SCOPE: Dict[str, Any] = {}
+
+
+# ---- Auto-generated project briefs (lightweight repo memory) ----
+PROJECT_BRIEFS_PATH = os.path.join(BASE_DIR, "memory", "_project_briefs.json")
+PROJECT_BRIEFS_META_PATH = os.path.join(BASE_DIR, "memory", "_project_briefs_meta.json")
+REPO_MAP_PATH = os.path.join(BASE_DIR, "memory", "_repo_map.json")
+
+
+def _sha256_text(text: str) -> str:
+    import hashlib
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _load_json_file(path: str, default: Any) -> Any:
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return default
+    except json.JSONDecodeError:
+        return default
+
+
+def _write_json_file(path: str, obj: Any) -> None:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(obj, f, ensure_ascii=False, indent=2)
+
+
+def build_repo_map(max_files: int = 2000) -> Dict[str, Any]:
+    """Create a lightweight map of the repo to help the assistant navigate."""
+    repo_map: Dict[str, Any] = {"generated_at": time.time(), "files": []}
+    count = 0
+    for root, dirs, files in os.walk(BASE_DIR):
+        # Skip noisy dirs
+        dirs[:] = [d for d in dirs if d not in {".git", "__pycache__", ".venv", "venv", ".pytest_cache"}]
+        for name in files:
+            if name.startswith('.'):  # skip dotfiles
+                continue
+            rel = os.path.relpath(os.path.join(root, name), BASE_DIR)
+            if rel.startswith("memory/_project_briefs") or rel.startswith("memory/_repo_map"):
+                continue
+            repo_map["files"].append(rel)
+            count += 1
+            if count >= max_files:
+                repo_map["truncated"] = True
+                return repo_map
+    repo_map["truncated"] = False
+    return repo_map
+
+
+def refresh_project_briefs(client: OpenAI, model: str = "gpt-4.1-mini", force: bool = False) -> Dict[str, Any]:
+    """Summarize each memory/*.md file into memory/_project_briefs.json with caching."""
+    os.makedirs(os.path.join(BASE_DIR, "memory"), exist_ok=True)
+
+    meta: Dict[str, Any] = _load_json_file(PROJECT_BRIEFS_META_PATH, {})
+    briefs: Dict[str, Any] = _load_json_file(PROJECT_BRIEFS_PATH, {})
+
+    updated = []
+    skipped = []
+
+    # scan memory/*.md
+    mem_dir = os.path.join(BASE_DIR, "memory")
+    paths = sorted(
+        [os.path.join(mem_dir, p) for p in os.listdir(mem_dir) if p.endswith('.md') and not p.startswith('_')]
+    )
+
+    for path in paths:
+        rel = os.path.relpath(path, BASE_DIR)
+        try:
+            text = Path(path).read_text(encoding='utf-8')
+        except Exception as exc:  # noqa: BLE001
+            briefs[rel] = {"error": str(exc)}
+            updated.append(rel)
+            continue
+
+        sha = _sha256_text(text)
+        prev = meta.get(rel, {})
+        if not force and prev.get("sha256") == sha:
+            skipped.append(rel)
+            continue
+
+        prompt = f"""You are summarizing a project research memo for later reuse.
+Return STRICT JSON only.
+
+Schema:
+{{
+  "project_name": string,
+  "one_liner": string,
+  "goal": string,
+  "current_state": string,
+  "key_ideas": [string],
+  "open_questions": [string],
+  "next_actions": [string],
+  "keywords": [string]
+}}
+
+FILE: {rel}
+
+CONTENT:
+{text}
+"""
+
+        resp = client.responses.create(
+            model=model,
+            input=prompt,
+        )
+        raw = resp.output_text.strip()
+        try:
+            obj = json.loads(raw)
+        except Exception:
+            obj = {"parse_error": True, "raw": raw[:4000]}
+
+        briefs[rel] = obj
+        meta[rel] = {"sha256": sha, "updated_at": time.time(), "model": model}
+        updated.append(rel)
+
+    # write repo map too
+    repo_map = build_repo_map()
+    _write_json_file(REPO_MAP_PATH, repo_map)
+
+    _write_json_file(PROJECT_BRIEFS_PATH, briefs)
+    _write_json_file(PROJECT_BRIEFS_META_PATH, meta)
+
+    return {
+        "ok": True,
+        "updated": updated,
+        "skipped": skipped,
+        "briefs_path": PROJECT_BRIEFS_PATH,
+        "repo_map_path": REPO_MAP_PATH,
+    }
 
 
 PYTHON_TOOL = [
@@ -210,6 +342,33 @@ def run_python(code: str) -> Dict[str, Any]:
             return {"status_code": response.status_code, "json": response.json()}
         return {"status_code": response.status_code, "text": response.text}
 
+
+
+    # Context management helpers
+    try:
+        from tools.context_manager import (
+            ContextPaths,
+            snapshot_index,
+            prune_index_keep_last_messages,
+            read_jsonl as cm_read_jsonl,
+            format_for_summary,
+            write_summary_markdown,
+        )
+    except Exception:  # noqa: BLE001
+        ContextPaths = None
+        snapshot_index = None
+        prune_index_keep_last_messages = None
+        cm_read_jsonl = None
+        format_for_summary = None
+        write_summary_markdown = None
+
+    # Claude Code CLI helper (if installed)
+    try:
+        from tools.claude_code import run_claude, which_claude
+    except Exception:  # noqa: BLE001
+        run_claude = None
+        which_claude = None
+
     runtime_scope = {
         "append_item": append_item,
         "append_message": append_message,
@@ -222,6 +381,14 @@ def run_python(code: str) -> Dict[str, Any]:
         "s2_paper_details": s2_paper_details,
         "s2_recommend_papers": s2_recommend_papers,
         "http_get": http_get,
+        "run_claude": run_claude,
+        "which_claude": which_claude,
+        "ContextPaths": ContextPaths,
+        "snapshot_index": snapshot_index,
+        "prune_index_keep_last_messages": prune_index_keep_last_messages,
+        "cm_read_jsonl": cm_read_jsonl,
+        "format_for_summary": format_for_summary,
+        "write_summary_markdown": write_summary_markdown,
         "os": os,
         "requests": requests,
         "INDEX_PATH": INDEX_PATH,
