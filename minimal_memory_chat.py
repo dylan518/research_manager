@@ -60,6 +60,7 @@ from research_manager.tools import ...    # WRONG — do not import
 - `s2_search_papers(query, limit=20, year=None)` → dict — Semantic Scholar search
 - `s2_paper_details(paper_id)` → dict — full paper metadata
 - `s2_recommend_papers(paper_id, limit=20)` → dict — related papers
+- `s2_read_paper_text(paper_id, max_chars=15000)` → dict — download open-access PDF and extract full text; returns `{"success": bool, "text": str, "pdf_url": str}` — use this to actually read a paper after finding it
 - `http_get(url, params=None)` → dict — HTTP GET (returns `json` or `text` key)
 
 ### Context management
@@ -225,7 +226,7 @@ PYTHON_TOOL = [
     {
         "type": "function",
         "name": "python",
-        "description": "Execute Python code with helper functions for index.jsonl memory operations.",
+        "description": "Execute Python code. Pre-injected helpers: s2_search_papers, s2_read_paper_text, s2_paper_details, http_get, run_claude, append_message, read_index_entries, snapshot_index, and more. Use for research, web access, file I/O, and delegating tasks to Claude Code.",
         "parameters": {
             "type": "object",
             "properties": {"code": {"type": "string"}},
@@ -503,6 +504,14 @@ def run_python(code: str) -> Dict[str, Any]:
         run_claude = None
         which_claude = None
 
+    # S2 full paper text (PDF download + parse)
+    try:
+        from research_manager.clients.semantic_scholar import SemanticScholarClient as _S2Client
+        _s2_client = _S2Client(api_key=os.getenv("S2_KEY"))
+        s2_read_paper_text = _s2_client.read_full_paper_text
+    except Exception:  # noqa: BLE001
+        s2_read_paper_text = None
+
     runtime_scope = {
         "append_item": append_item,
         "append_message": append_message,
@@ -514,6 +523,7 @@ def run_python(code: str) -> Dict[str, Any]:
         "s2_search_papers": s2_search_papers,
         "s2_paper_details": s2_paper_details,
         "s2_recommend_papers": s2_recommend_papers,
+        "s2_read_paper_text": s2_read_paper_text,
         "http_get": http_get,
         "run_claude": run_claude,
         "which_claude": which_claude,
@@ -532,6 +542,7 @@ def run_python(code: str) -> Dict[str, Any]:
 
     try:
         PYTHON_GLOBAL_SCOPE.pop("__last_expression_result__", None)
+        PYTHON_GLOBAL_SCOPE.pop("result", None)
 
         tree = ast.parse(code, mode="exec")
         if tree.body and isinstance(tree.body[-1], ast.Expr):
