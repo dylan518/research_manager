@@ -11,6 +11,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List
 
+from research_manager.tools.trace_logger import get_trace_logger
+
 
 @dataclass
 class ContextPaths:
@@ -19,8 +21,11 @@ class ContextPaths:
 
 
 def read_jsonl(path: Path) -> List[Dict[str, Any]]:
+    trace = get_trace_logger()
+    turn_id = int(__import__("os").getenv("RM_TURN_ID", "0"))
     out: List[Dict[str, Any]] = []
     if not path.exists():
+        trace.emit(turn_id=turn_id, event_type="memory_read", message="read_jsonl missing", data={"path": str(path), "records": 0})
         return out
     for line in path.read_text(encoding="utf-8").splitlines():
         line = line.strip()
@@ -32,24 +37,34 @@ def read_jsonl(path: Path) -> List[Dict[str, Any]]:
                 out.append(obj)
         except json.JSONDecodeError:
             continue
+    trace.emit(turn_id=turn_id, event_type="memory_read", message="read_jsonl", data={"path": str(path), "records": len(out)})
     return out
 
 
 def write_jsonl(path: Path, items: List[Dict[str, Any]]) -> None:
+    trace = get_trace_logger()
+    turn_id = int(__import__("os").getenv("RM_TURN_ID", "0"))
     path.write_text("\n".join(json.dumps(it, ensure_ascii=True) for it in items) + "\n", encoding="utf-8")
+    trace.emit(turn_id=turn_id, event_type="memory_write", message="write_jsonl", data={"path": str(path), "records": len(items)})
 
 
 def append_jsonl(path: Path, item: Dict[str, Any]) -> None:
+    trace = get_trace_logger()
+    turn_id = int(__import__("os").getenv("RM_TURN_ID", "0"))
     with path.open("a", encoding="utf-8") as f:
         f.write(json.dumps(item, ensure_ascii=True) + "\n")
+    trace.emit(turn_id=turn_id, event_type="memory_write", message="append_jsonl", data={"path": str(path), "records_added": 1})
 
 
 def snapshot_index(paths: ContextPaths, label: str = "snapshot") -> Dict[str, Any]:
+    trace = get_trace_logger()
+    turn_id = int(__import__("os").getenv("RM_TURN_ID", "0"))
     ts = int(time.time())
     items = read_jsonl(paths.index_path)
     paths.memory_dir.mkdir(parents=True, exist_ok=True)
     snap_path = paths.memory_dir / f"index_snapshot_{ts}_{label}.jsonl"
     write_jsonl(snap_path, items)
+    trace.emit(turn_id=turn_id, event_type="memory_snapshot_created", message="snapshot_index", data={"snapshot_path": str(snap_path), "count": len(items)})
     return {"ok": True, "snapshot": str(snap_path), "count": len(items)}
 
 

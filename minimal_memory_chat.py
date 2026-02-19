@@ -23,11 +23,77 @@ INDEX_PATH = os.path.join(BASE_DIR, "index.jsonl")
 ENV_PATH = os.path.join(BASE_DIR, ".env")
 PYTHON_GLOBAL_SCOPE: Dict[str, Any] = {}
 
+PINNED_PATH = os.path.join(BASE_DIR, "memory", "_pinned.md")
+PROJECT_INDEX_PATH = os.path.join(BASE_DIR, "memory", "generated", "_project_index.md")
+DEBUG_PAYLOAD_PATH = os.path.join(BASE_DIR, "state", "debug_last_request.json")
 
 # ---- Auto-generated project briefs (lightweight repo memory) ----
 PROJECT_BRIEFS_PATH = os.path.join(BASE_DIR, "memory", "generated", "_project_briefs.json")
 PROJECT_BRIEFS_META_PATH = os.path.join(BASE_DIR, "memory", "generated", "_project_briefs_meta.json")
 REPO_MAP_PATH = os.path.join(BASE_DIR, "memory", "generated", "_repo_map.json")
+
+# ---- Python scope reference injected into system prompt ----
+PYTHON_HELPERS_DOC = """## Python scope: pre-injected helpers
+
+**IMPORTANT: Do NOT use import statements for any of these. They are already injected as globals into every `python` tool call. Just call them directly.**
+
+Example of correct usage:
+```python
+results = s2_search_papers("verifier self-play", limit=5)
+```
+
+Example of WRONG usage (will fail with ModuleNotFoundError):
+```python
+from tools.claude_code import run_claude  # WRONG — do not import
+from research_manager.tools import ...    # WRONG — do not import
+```
+
+### Index / memory
+- `append_message(role, content)` — append chat message to index.jsonl
+- `append_item(item)` — append any JSON object to index.jsonl
+- `write_index_entries(entries)` — overwrite index.jsonl with a list
+- `delete_index_line(line_number)` — delete line N from index.jsonl
+- `read_index_entries()` → list — all entries from index.jsonl
+- `recent_entries(limit=20)` → list — last N entries
+
+### Research
+- `s2_search_papers(query, limit=20, year=None)` → dict — Semantic Scholar search
+- `s2_paper_details(paper_id)` → dict — full paper metadata
+- `s2_recommend_papers(paper_id, limit=20)` → dict — related papers
+- `http_get(url, params=None)` → dict — HTTP GET (returns `json` or `text` key)
+
+### Context management
+- `ContextPaths(index_path=Path(...), memory_dir=Path(...))` — path dataclass
+- `snapshot_index(paths, label)` → dict — snapshot index.jsonl to memory/generated/
+- `prune_index_keep_last_messages(paths, keep_last=50)` → dict — prune old entries
+- `cm_read_jsonl(path)` → list — read any JSONL file
+- `format_for_summary(items)` → str — format entries as readable markdown
+- `write_summary_markdown(paths, summary_md, label)` → str path
+
+### Claude Code
+- `run_claude(prompt, cwd=None, add_dirs=None, dangerously_skip_permissions=False, continue_session=False, resume_session=None, timeout_s=1800)` → dict
+  - Runs Claude Code CLI non-interactively; output streams live to terminal
+  - Returns `{"ok": bool, "returncode": int, "stdout": str, "stderr": str}`
+  - Read `result["stdout"]` for Claude's output
+
+  **Permission mode** — controls whether Claude acts or just describes:
+  - `dangerously_skip_permissions=False` (default): Claude cannot approve file writes, so it only describes what it would do
+  - `dangerously_skip_permissions=True`: Claude actually creates/edits/runs files — use this for any task where you want work done
+
+  **Session memory** — each call is a fresh session by default (no memory of previous calls):
+  - `continue_session=True`: resumes the most recent Claude Code session in the workspace — Claude remembers prior context and file changes from earlier calls
+  - `resume_session="<uuid>"`: resumes a specific session by ID
+  - Without either flag: each `run_claude` call starts fresh with no prior context
+  - Note: `CLAUDE.md` in the repo root is always read on every call regardless of session
+- `which_claude()` → dict — discover claude binary locations
+
+### Environment & filesystem
+- `get_env(name, default=None)` — read env var (use for API keys)
+- `INDEX_PATH` — str path to index.jsonl
+- `ENV_PATH` — str path to .env
+- `os` — stdlib os module, e.g. `os.listdir(path)`, `os.path.exists(path)`, `os.path.join(...)`
+- `requests` — HTTP library, e.g. `requests.get(url).json()`
+- `open(path).read()` — read any file directly"""
 
 
 def _sha256_text(text: str) -> str:
@@ -181,6 +247,52 @@ def ensure_files() -> None:
 def load_instructions() -> str:
     with open(INSTRUCTIONS_PATH, "r", encoding="utf-8") as f:
         return f.read()
+
+
+def build_system_prompt() -> str:
+    """Assemble the full system prompt from instructions + pinned memory + helpers + project index."""
+    parts: List[str] = []
+
+    parts.append(load_instructions().strip())
+
+    if os.path.exists(PINNED_PATH):
+        pinned = Path(PINNED_PATH).read_text(encoding="utf-8").strip()
+        if pinned:
+            parts.append(pinned)
+
+    parts.append(PYTHON_HELPERS_DOC.strip())
+
+    if os.path.exists(PROJECT_INDEX_PATH):
+        index_md = Path(PROJECT_INDEX_PATH).read_text(encoding="utf-8").strip()
+        if index_md:
+            parts.append(index_md)
+
+    return "\n\n---\n\n".join(parts)
+
+
+_debug_turn_rounds: List[Dict[str, Any]] = []
+
+
+def _debug_new_turn() -> None:
+    """Reset the per-turn round accumulator at the start of each user message."""
+    global _debug_turn_rounds
+    _debug_turn_rounds = []
+
+
+def write_debug_payload(label: str, **kwargs: Any) -> None:
+    """Append this API call to the current turn and flush to state/debug_last_request.json.
+
+    The file always reflects the full picture for the current user turn:
+      rounds[0] = initial call  (has instructions + full input history)
+      rounds[1] = tool_continuation_1 (has tool outputs)
+      ...
+    """
+    global _debug_turn_rounds
+    os.makedirs(os.path.dirname(DEBUG_PAYLOAD_PATH), exist_ok=True)
+    _debug_turn_rounds.append({"label": label, **kwargs})
+    payload = {"ts": time.time(), "turn_rounds": len(_debug_turn_rounds), "rounds": _debug_turn_rounds}
+    with open(DEBUG_PAYLOAD_PATH, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2, ensure_ascii=False, default=str)
 
 
 def read_index_entries() -> List[Dict[str, Any]]:
@@ -522,22 +634,32 @@ def main() -> None:
             break
 
         # index.jsonl is the full chat history; append current user turn first.
+        _debug_new_turn()
         append_message("user", user_input)
         history_items = build_model_history_items(read_index_entries())
-        instructions = load_instructions()
+        system_prompt = build_system_prompt()
 
+        write_debug_payload(
+            label="initial",
+            model=model,
+            instructions=system_prompt,
+            input=history_items,
+            tools=PYTHON_TOOL,
+        )
         response = client.responses.create(
             model=model,
-            instructions=instructions,
+            instructions=system_prompt,
             input=history_items,
             tools=PYTHON_TOOL,
         )
 
+        tool_round = 0
         while True:
             function_calls = [item for item in response.output if item.type == "function_call"]
             if not function_calls:
                 break
 
+            tool_round += 1
             tool_outputs: List[Dict[str, Any]] = []
             for call in function_calls:
                 append_item(
@@ -574,6 +696,13 @@ def main() -> None:
                     }
                 )
 
+            write_debug_payload(
+                label=f"tool_continuation_{tool_round}",
+                model=model,
+                previous_response_id=response.id,
+                input=tool_outputs,
+                tools=PYTHON_TOOL,
+            )
             response = client.responses.create(
                 model=model,
                 previous_response_id=response.id,
