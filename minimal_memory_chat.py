@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from dotenv import dotenv_values, load_dotenv
-from openai import OpenAI
+from openai import BadRequestError, OpenAI
 import requests
 
 
@@ -31,6 +31,22 @@ DEBUG_PAYLOAD_PATH = os.path.join(BASE_DIR, "state", "debug_last_request.json")
 PROJECT_BRIEFS_PATH = os.path.join(BASE_DIR, "memory", "generated", "_project_briefs.json")
 PROJECT_BRIEFS_META_PATH = os.path.join(BASE_DIR, "memory", "generated", "_project_briefs_meta.json")
 REPO_MAP_PATH = os.path.join(BASE_DIR, "memory", "generated", "_repo_map.json")
+
+# ---- Size / context guards ----
+MAX_TOOL_ARGS_CHARS = 12000
+MAX_TOOL_OUTPUT_CHARS = 60000
+MAX_PYTHON_STDOUT_CHARS = 40000
+MAX_PYTHON_RESULT_JSON_CHARS = 40000
+MAX_SYSTEM_PROMPT_CHARS = 24000
+MAX_SINGLE_MESSAGE_CHARS = 12000
+FALLBACK_SINGLE_MESSAGE_CHARS = 4000
+FALLBACK_HISTORY_MESSAGES = 40
+MAX_HISTORY_MESSAGES = 120
+MAX_HISTORY_CHARS = 160000
+KEEP_LAST_MESSAGES_ON_COMPACT = 70
+MAX_COMPACT_SUMMARY_CHARS = 8000
+MAX_PINNED_CHARS = 10000
+MAX_PROJECT_INDEX_CHARS = 12000
 
 # ---- Python scope reference injected into system prompt ----
 PYTHON_HELPERS_DOC = """## Python scope: pre-injected helpers
@@ -226,10 +242,15 @@ PYTHON_TOOL = [
     {
         "type": "function",
         "name": "python",
-        "description": "Execute Python code. Pre-injected helpers: s2_search_papers, s2_read_paper_text, s2_paper_details, http_get, run_claude, append_message, read_index_entries, snapshot_index, and more. Use for research, web access, file I/O, and delegating tasks to Claude Code.",
+        "description": "Execute Python code in a persistent session. Use this for all research, web fetches, file I/O, and delegating tasks to Claude Code CLI.",
         "parameters": {
             "type": "object",
-            "properties": {"code": {"type": "string"}},
+            "properties": {
+                "code": {
+                    "type": "string",
+                    "description": "Python code to execute. Helper globals are pre-injected (s2_search_papers, s2_read_paper_text, http_get, run_claude, append_message, etc.) — do NOT import them.",
+                }
+            },
             "required": ["code"],
             "additionalProperties": False,
         },
@@ -250,6 +271,17 @@ def load_instructions() -> str:
         return f.read()
 
 
+def _truncate_text(text: str, max_chars: int) -> str:
+    if len(text) <= max_chars:
+        return text
+    head = max_chars // 2
+    tail = max_chars - head - 48
+    if tail < 0:
+        tail = 0
+    omitted = len(text) - (head + tail)
+    return f"{text[:head]}\n...[TRUNCATED {omitted} chars]...\n{text[-tail:] if tail else ''}"
+
+
 def build_system_prompt() -> str:
     """Assemble the full system prompt from instructions + pinned memory + helpers + project index."""
     parts: List[str] = []
@@ -259,14 +291,14 @@ def build_system_prompt() -> str:
     if os.path.exists(PINNED_PATH):
         pinned = Path(PINNED_PATH).read_text(encoding="utf-8").strip()
         if pinned:
-            parts.append(pinned)
+            parts.append(_truncate_text(pinned, MAX_PINNED_CHARS))
 
     parts.append(PYTHON_HELPERS_DOC.strip())
 
     if os.path.exists(PROJECT_INDEX_PATH):
         index_md = Path(PROJECT_INDEX_PATH).read_text(encoding="utf-8").strip()
         if index_md:
-            parts.append(index_md)
+            parts.append(_truncate_text(index_md, MAX_PROJECT_INDEX_CHARS))
 
     return "\n\n---\n\n".join(parts)
 
@@ -312,15 +344,72 @@ def read_index_entries() -> List[Dict[str, Any]]:
     return entries
 
 
-def build_model_history_items(entries: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+def build_model_history_items(
+    entries: List[Dict[str, Any]],
+    *,
+    per_message_chars: int = MAX_SINGLE_MESSAGE_CHARS,
+    max_messages: int = MAX_HISTORY_MESSAGES,
+) -> List[Dict[str, Any]]:
     allowed_roles = {"user", "assistant", "system", "developer"}
     items: List[Dict[str, Any]] = []
     for entry in entries:
         role = entry.get("role")
         content = entry.get("content")
         if isinstance(role, str) and role in allowed_roles and content is not None:
-            items.append({"role": role, "content": content})
+            text = content if isinstance(content, str) else str(content)
+            items.append({"role": role, "content": _truncate_text(text, per_message_chars)})
+    if len(items) > max_messages:
+        items = items[-max_messages:]
     return items
+
+
+def _history_char_count(items: List[Dict[str, Any]]) -> int:
+    total = 0
+    for item in items:
+        content = item.get("content")
+        if isinstance(content, str):
+            total += len(content)
+        else:
+            total += len(str(content))
+    return total
+
+
+def auto_compact_context_if_needed() -> Dict[str, Any]:
+    entries = read_index_entries()
+    messages = build_model_history_items(entries)
+    message_count = len(messages)
+    char_count = _history_char_count(messages)
+    if message_count <= MAX_HISTORY_MESSAGES and char_count <= MAX_HISTORY_CHARS:
+        return {"triggered": False, "messages": message_count, "chars": char_count}
+
+    keep_last = min(KEEP_LAST_MESSAGES_ON_COMPACT, max(1, message_count))
+    older = messages[:-keep_last]
+    kept = messages[-keep_last:]
+
+    summary_lines = []
+    for item in older[-250:]:
+        role = item.get("role", "unknown")
+        content = str(item.get("content", "")).replace("\n", " ").strip()
+        summary_lines.append(f"{role}: {content[:280]}")
+    summary_text = _truncate_text("\n".join(summary_lines), MAX_COMPACT_SUMMARY_CHARS)
+    summary_item = {
+        "role": "system",
+        "content": (
+            "[AUTO-CONTEXT-SUMMARY]\n"
+            "Older conversation was compacted automatically to stay within model context limits.\n"
+            f"{summary_text}"
+        ),
+    }
+
+    write_index_entries([summary_item] + kept)
+    new_messages = [summary_item] + kept
+    return {
+        "triggered": True,
+        "messages_before": message_count,
+        "chars_before": char_count,
+        "messages_after": len(new_messages),
+        "chars_after": _history_char_count(new_messages),
+    }
 
 
 def append_item(item: Dict[str, Any]) -> Dict[str, Any]:
@@ -585,9 +674,19 @@ def run_python(code: str) -> Dict[str, Any]:
             }
 
         stdout_text = stdout.getvalue()
+        if len(stdout_text) > MAX_PYTHON_STDOUT_CHARS:
+            stdout_text = _truncate_text(stdout_text, MAX_PYTHON_STDOUT_CHARS)
+
         result = PYTHON_GLOBAL_SCOPE.get("result", PYTHON_GLOBAL_SCOPE.get("__last_expression_result__"))
         if result is None and stdout_text.strip():
             result = stdout_text.strip()
+        if result is not None:
+            try:
+                result_json = json.dumps(_to_json_safe(result), ensure_ascii=False)
+                if len(result_json) > MAX_PYTHON_RESULT_JSON_CHARS:
+                    result = _truncate_text(result_json, MAX_PYTHON_RESULT_JSON_CHARS)
+            except Exception:  # noqa: BLE001
+                result = _truncate_text(str(result), MAX_PYTHON_RESULT_JSON_CHARS)
         return {
             "ok": True,
             "stdout": stdout_text,
@@ -619,6 +718,26 @@ def _to_json_safe(value: Any) -> Any:
     return str(value)
 
 
+def _compact_tool_output_obj(output: Dict[str, Any]) -> Dict[str, Any]:
+    compacted = dict(_to_json_safe(output))
+    if "stdout" in compacted and isinstance(compacted["stdout"], str):
+        compacted["stdout"] = _truncate_text(compacted["stdout"], MAX_PYTHON_STDOUT_CHARS)
+    if "error" in compacted and isinstance(compacted["error"], str):
+        compacted["error"] = _truncate_text(compacted["error"], MAX_PYTHON_RESULT_JSON_CHARS)
+    if "result" in compacted:
+        result_val = compacted["result"]
+        if isinstance(result_val, str):
+            compacted["result"] = _truncate_text(result_val, MAX_PYTHON_RESULT_JSON_CHARS)
+        else:
+            try:
+                result_json = json.dumps(result_val, ensure_ascii=False)
+                if len(result_json) > MAX_PYTHON_RESULT_JSON_CHARS:
+                    compacted["result"] = _truncate_text(result_json, MAX_PYTHON_RESULT_JSON_CHARS)
+            except Exception:  # noqa: BLE001
+                compacted["result"] = _truncate_text(str(result_val), MAX_PYTHON_RESULT_JSON_CHARS)
+    return compacted
+
+
 def main() -> None:
     ensure_files()
     load_dotenv(dotenv_path=ENV_PATH, override=True)
@@ -647,8 +766,15 @@ def main() -> None:
         # index.jsonl is the full chat history; append current user turn first.
         _debug_new_turn()
         append_message("user", user_input)
+        compact_info = auto_compact_context_if_needed()
+        if compact_info.get("triggered"):
+            print(
+                f"[context] auto-compacted history "
+                f"({compact_info['messages_before']} msgs/{compact_info['chars_before']} chars -> "
+                f"{compact_info['messages_after']} msgs/{compact_info['chars_after']} chars)"
+            )
         history_items = build_model_history_items(read_index_entries())
-        system_prompt = build_system_prompt()
+        system_prompt = _truncate_text(build_system_prompt(), MAX_SYSTEM_PROMPT_CHARS)
 
         write_debug_payload(
             label="initial",
@@ -657,12 +783,29 @@ def main() -> None:
             input=history_items,
             tools=PYTHON_TOOL,
         )
-        response = client.responses.create(
-            model=model,
-            instructions=system_prompt,
-            input=history_items,
-            tools=PYTHON_TOOL,
-        )
+        try:
+            response = client.responses.create(
+                model=model,
+                instructions=system_prompt,
+                input=history_items,
+                tools=PYTHON_TOOL,
+            )
+        except BadRequestError as exc:
+            if "context_length_exceeded" not in str(exc):
+                raise
+            fallback_history_items = build_model_history_items(
+                read_index_entries(),
+                per_message_chars=FALLBACK_SINGLE_MESSAGE_CHARS,
+                max_messages=FALLBACK_HISTORY_MESSAGES,
+            )
+            fallback_prompt = _truncate_text(system_prompt, MAX_SYSTEM_PROMPT_CHARS // 2)
+            print("[context] request exceeded context window; retrying with aggressive truncation.")
+            response = client.responses.create(
+                model=model,
+                instructions=fallback_prompt,
+                input=fallback_history_items,
+                tools=PYTHON_TOOL,
+            )
 
         tool_round = 0
         while True:
@@ -678,7 +821,7 @@ def main() -> None:
                         "type": "function_call",
                         "name": call.name,
                         "call_id": call.call_id,
-                        "arguments": call.arguments or "",
+                        "arguments": _truncate_text(call.arguments or "", MAX_TOOL_ARGS_CHARS),
                     }
                 )
                 try:
@@ -691,7 +834,16 @@ def main() -> None:
                 except Exception as exc:  # noqa: BLE001
                     output = {"ok": False, "error": str(exc)}
 
-                output_str = json.dumps(_to_json_safe(output))
+                output_obj = _compact_tool_output_obj(output)
+                output_str = json.dumps(output_obj, ensure_ascii=False)
+                if len(output_str) > MAX_TOOL_OUTPUT_CHARS:
+                    output_obj = {
+                        "ok": bool(output_obj.get("ok", False)),
+                        "error": "Tool output exceeded max size and was truncated.",
+                        "stdout": _truncate_text(str(output_obj.get("stdout", "")), MAX_PYTHON_STDOUT_CHARS),
+                        "result": _truncate_text(str(output_obj.get("result", "")), MAX_PYTHON_RESULT_JSON_CHARS),
+                    }
+                    output_str = json.dumps(output_obj, ensure_ascii=False)
                 append_item(
                     {
                         "type": "function_call_output",
